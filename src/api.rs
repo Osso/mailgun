@@ -288,20 +288,26 @@ pub struct BouncesResponse {
     pub paging: Option<Paging>,
 }
 
-impl Paginated for BouncesResponse {
-    fn paging(&self) -> Option<&Paging> {
-        self.paging.as_ref()
-    }
-    fn set_paging(&mut self, paging: Option<Paging>) {
-        self.paging = paging;
-    }
-    fn extend_items(&mut self, other: Self) {
-        self.items.extend(other.items);
-    }
-    fn items_empty(other: &Self) -> bool {
-        other.items.is_empty()
-    }
+macro_rules! impl_paginated {
+    ($type:ty) => {
+        impl Paginated for $type {
+            fn paging(&self) -> Option<&Paging> {
+                self.paging.as_ref()
+            }
+            fn set_paging(&mut self, paging: Option<Paging>) {
+                self.paging = paging;
+            }
+            fn extend_items(&mut self, other: Self) {
+                self.items.extend(other.items);
+            }
+            fn items_empty(other: &Self) -> bool {
+                other.items.is_empty()
+            }
+        }
+    };
 }
+
+impl_paginated!(BouncesResponse);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Bounce {
@@ -317,20 +323,7 @@ pub struct ComplaintsResponse {
     pub paging: Option<Paging>,
 }
 
-impl Paginated for ComplaintsResponse {
-    fn paging(&self) -> Option<&Paging> {
-        self.paging.as_ref()
-    }
-    fn set_paging(&mut self, paging: Option<Paging>) {
-        self.paging = paging;
-    }
-    fn extend_items(&mut self, other: Self) {
-        self.items.extend(other.items);
-    }
-    fn items_empty(other: &Self) -> bool {
-        other.items.is_empty()
-    }
-}
+impl_paginated!(ComplaintsResponse);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Complaint {
@@ -344,20 +337,7 @@ pub struct UnsubscribesResponse {
     pub paging: Option<Paging>,
 }
 
-impl Paginated for UnsubscribesResponse {
-    fn paging(&self) -> Option<&Paging> {
-        self.paging.as_ref()
-    }
-    fn set_paging(&mut self, paging: Option<Paging>) {
-        self.paging = paging;
-    }
-    fn extend_items(&mut self, other: Self) {
-        self.items.extend(other.items);
-    }
-    fn items_empty(other: &Self) -> bool {
-        other.items.is_empty()
-    }
-}
+impl_paginated!(UnsubscribesResponse);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Unsubscribe {
