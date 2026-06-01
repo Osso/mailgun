@@ -5,12 +5,17 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 
-use config::Region;
+use config::{Region, SiteConfig};
+
+const MESSAGE_PREVIEW_CHARS: usize = 500;
 
 #[derive(Parser)]
 #[command(name = "mailgun")]
 #[command(about = "CLI tool to access Mailgun API")]
 struct Cli {
+    /// Site to use (from config). Defaults to the configured default site.
+    #[arg(short, long, global = true)]
+    site: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -85,18 +90,46 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Configure API key and domain
+    /// Manage configured sites (credentials per Mailgun account/domain)
     Config {
+        #[command(subcommand)]
+        action: Option<ConfigCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Add or update a site's credentials
+    Set {
+        /// Site name (e.g., "globalcomix", "mangahelpers")
+        name: String,
         /// Mailgun API key
         #[arg(short = 'k', long)]
-        api_key: Option<String>,
+        api_key: String,
         /// Mailgun domain (e.g., mg.example.com)
         #[arg(short, long)]
-        domain: Option<String>,
+        domain: String,
         /// Region: us or eu
-        #[arg(short, long)]
-        region: Option<String>,
+        #[arg(short, long, default_value = "us")]
+        region: String,
+        /// Set as the default site
+        #[arg(long)]
+        default: bool,
     },
+    /// List configured sites
+    List,
+    /// Set the default site
+    Default {
+        /// Site name to set as default
+        name: String,
+    },
+    /// Remove a site from config
+    Remove {
+        /// Site name to remove
+        name: String,
+    },
+    /// Show config file path
+    Path,
 }
 
 #[derive(Subcommand)]
@@ -126,18 +159,10 @@ enum UnsubscribesCommands {
     },
 }
 
-fn get_client() -> Result<api::Client> {
+fn get_client(site: Option<&str>) -> Result<api::Client> {
     let cfg = config::load_config()?;
-
-    let api_key = cfg
-        .api_key
-        .ok_or_else(|| anyhow::anyhow!("API key not configured. Run 'mailgun config -k <key>'"))?;
-
-    let domain = cfg.domain.ok_or_else(|| {
-        anyhow::anyhow!("Domain not configured. Run 'mailgun config -d <domain>'")
-    })?;
-
-    api::Client::new(&api_key, &domain, cfg.region)
+    let resolved = cfg.resolve_site(site)?;
+    api::Client::new(&resolved.api_key, &resolved.domain, resolved.region)
 }
 
 fn format_timestamp(ts: f64) -> String {
@@ -287,14 +312,7 @@ fn print_headers(headers: &api::StoredMessageHeaders) {
     }
 }
 
-fn print_message(msg: &api::StoredMessage, headers_only: bool) {
-    if headers_only {
-        println!("=== Headers ===");
-        print_headers(&msg.headers);
-        return;
-    }
-
-    println!("=== Message Details ===");
+fn print_message_metadata(msg: &api::StoredMessage) {
     if let Some(subject) = &msg.subject {
         println!("Subject: {}", subject);
     }
@@ -304,6 +322,48 @@ fn print_message(msg: &api::StoredMessage, headers_only: bool) {
     if let Some(to) = &msg.to {
         println!("To: {}", to);
     }
+}
+
+fn print_message_text(text: Option<&str>) {
+    let Some(text) = text else {
+        println!("Text: (none)");
+        return;
+    };
+
+    let preview: String = text.chars().take(MESSAGE_PREVIEW_CHARS).collect();
+    if text.len() > MESSAGE_PREVIEW_CHARS {
+        println!(
+            "Text (truncated):\n{}\n... ({} chars total)",
+            preview,
+            text.len()
+        );
+    } else {
+        println!("Text:\n{}", text);
+    }
+}
+
+fn print_message_attachments(attachments: &[api::AttachmentInfo]) {
+    if attachments.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("=== Attachments ({}) ===", attachments.len());
+    for att in attachments {
+        let size_kb = att.size / 1024;
+        println!("{} ({} KB) [{}]", att.filename, size_kb, att.content_type);
+    }
+}
+
+fn print_message(msg: &api::StoredMessage, headers_only: bool) {
+    if headers_only {
+        println!("=== Headers ===");
+        print_headers(&msg.headers);
+        return;
+    }
+
+    println!("=== Message Details ===");
+    print_message_metadata(msg);
 
     println!();
     println!("=== Headers ===");
@@ -311,29 +371,8 @@ fn print_message(msg: &api::StoredMessage, headers_only: bool) {
 
     println!();
     println!("=== Body ===");
-    if let Some(text) = &msg.stripped_text {
-        let preview: String = text.chars().take(500).collect();
-        if text.len() > 500 {
-            println!(
-                "Text (truncated):\n{}\n... ({} chars total)",
-                preview,
-                text.len()
-            );
-        } else {
-            println!("Text:\n{}", text);
-        }
-    } else {
-        println!("Text: (none)");
-    }
-
-    if !msg.attachments.is_empty() {
-        println!();
-        println!("=== Attachments ({}) ===", msg.attachments.len());
-        for att in &msg.attachments {
-            let size_kb = att.size / 1024;
-            println!("{} ({} KB) [{}]", att.filename, size_kb, att.content_type);
-        }
-    }
+    print_message_text(msg.stripped_text.as_deref());
+    print_message_attachments(&msg.attachments);
 }
 
 #[derive(Default)]
@@ -410,12 +449,13 @@ fn print_stats(resp: api::StatsResponse) {
 }
 
 async fn run_events(
+    site: Option<&str>,
     event: Option<String>,
     recipient: Option<String>,
     limit: u32,
     json: bool,
 ) -> Result<()> {
-    let client = get_client()?;
+    let client = get_client(site)?;
     let resp = client
         .list_events(event.as_deref(), recipient.as_deref(), limit)
         .await?;
@@ -428,8 +468,13 @@ async fn run_events(
     Ok(())
 }
 
-async fn run_message(storage_url: String, json: bool, headers: bool) -> Result<()> {
-    let client = get_client()?;
+async fn run_message(
+    site: Option<&str>,
+    storage_url: String,
+    json: bool,
+    headers: bool,
+) -> Result<()> {
+    let client = get_client(site)?;
     let msg = client.fetch_stored_message(&storage_url).await?;
 
     if json {
@@ -440,8 +485,13 @@ async fn run_message(storage_url: String, json: bool, headers: bool) -> Result<(
     Ok(())
 }
 
-async fn run_bounces(limit: u32, json: bool, command: Option<BouncesCommands>) -> Result<()> {
-    let client = get_client()?;
+async fn run_bounces(
+    site: Option<&str>,
+    limit: u32,
+    json: bool,
+    command: Option<BouncesCommands>,
+) -> Result<()> {
+    let client = get_client(site)?;
 
     match command {
         Some(BouncesCommands::Delete { email }) => {
@@ -460,8 +510,13 @@ async fn run_bounces(limit: u32, json: bool, command: Option<BouncesCommands>) -
     Ok(())
 }
 
-async fn run_complaints(limit: u32, json: bool, command: Option<ComplaintsCommands>) -> Result<()> {
-    let client = get_client()?;
+async fn run_complaints(
+    site: Option<&str>,
+    limit: u32,
+    json: bool,
+    command: Option<ComplaintsCommands>,
+) -> Result<()> {
+    let client = get_client(site)?;
 
     match command {
         Some(ComplaintsCommands::Delete { email }) => {
@@ -481,11 +536,12 @@ async fn run_complaints(limit: u32, json: bool, command: Option<ComplaintsComman
 }
 
 async fn run_unsubscribes(
+    site: Option<&str>,
     limit: u32,
     json: bool,
     command: Option<UnsubscribesCommands>,
 ) -> Result<()> {
-    let client = get_client()?;
+    let client = get_client(site)?;
 
     match command {
         Some(UnsubscribesCommands::Delete { email }) => {
@@ -504,8 +560,8 @@ async fn run_unsubscribes(
     Ok(())
 }
 
-async fn run_stats(duration: String, json: bool) -> Result<()> {
-    let client = get_client()?;
+async fn run_stats(site: Option<&str>, duration: String, json: bool) -> Result<()> {
+    let client = get_client(site)?;
     let event_types = [
         "accepted",
         "delivered",
@@ -525,92 +581,176 @@ async fn run_stats(duration: String, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_config(
-    api_key: Option<String>,
-    domain: Option<String>,
-    region: Option<String>,
+fn run_config(action: Option<ConfigCommands>) -> Result<()> {
+    match action {
+        None | Some(ConfigCommands::List) => config_list(),
+        Some(ConfigCommands::Set {
+            name,
+            api_key,
+            domain,
+            region,
+            default,
+        }) => config_set(name, api_key, domain, region, default),
+        Some(ConfigCommands::Default { name }) => config_set_default(name),
+        Some(ConfigCommands::Remove { name }) => config_remove(name),
+        Some(ConfigCommands::Path) => {
+            println!("{}", config::config_path_display());
+            Ok(())
+        }
+    }
+}
+
+fn config_set(
+    name: String,
+    api_key: String,
+    domain: String,
+    region: String,
+    default: bool,
 ) -> Result<()> {
     let mut cfg = config::load_config().unwrap_or_default();
-
-    if api_key.is_none() && domain.is_none() && region.is_none() {
-        println!("Config file: ~/.config/mailgun-cli/config.toml");
-        println!();
-        if let Some(key) = &cfg.api_key {
-            let masked = if key.len() > 8 {
-                format!("{}...{}", &key[..4], &key[key.len() - 4..])
-            } else {
-                "*".repeat(key.len())
-            };
-            println!("API key: {}", masked);
-        } else {
-            println!("API key: (not set)");
-        }
-        println!("Domain:  {}", cfg.domain.as_deref().unwrap_or("(not set)"));
-        println!(
-            "Region:  {}",
-            match cfg.region {
-                Region::Us => "us",
-                Region::Eu => "eu",
-            }
-        );
-        return Ok(());
-    }
-
-    if let Some(key) = api_key {
-        cfg.api_key = Some(key);
-    }
-    if let Some(d) = domain {
-        cfg.domain = Some(d);
-    }
-    if let Some(r) = region {
-        cfg.region = match r.to_lowercase().as_str() {
-            "us" => Region::Us,
-            "eu" => Region::Eu,
-            _ => anyhow::bail!("Invalid region '{}'. Use 'us' or 'eu'.", r),
-        };
-    }
-
+    let site = SiteConfig {
+        api_key,
+        domain,
+        region: parse_region(&region)?,
+    };
+    cfg.set_site(&name, site, default);
     config::save_config(&cfg)?;
-    println!("Config saved to ~/.config/mailgun-cli/config.toml");
+    let marker = if cfg.default_site.as_deref() == Some(&name) {
+        " (default)"
+    } else {
+        ""
+    };
+    println!(
+        "Site '{}'{} saved to {}",
+        name,
+        marker,
+        config::config_path_display()
+    );
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn config_list() -> Result<()> {
+    let cfg = config::load_config()?;
+    println!("Config file: {}", config::config_path_display());
+    println!();
 
-    match cli.command {
+    if cfg.sites.is_empty() {
+        if cfg.api_key.is_some() && cfg.domain.is_some() {
+            println!("(legacy single-site config)");
+            println!(
+                "  domain:  {}",
+                cfg.domain.as_deref().unwrap_or("(not set)")
+            );
+            println!("  api key: {}", format_api_key(cfg.api_key.as_deref()));
+            println!("  region:  {}", region_label(cfg.region));
+            println!();
+            println!("Migrate with: mailgun config set <name> -k <key> -d <domain>");
+        } else {
+            println!("No sites configured.");
+            println!("Add one with: mailgun config set <name> -k <key> -d <domain>");
+        }
+        return Ok(());
+    }
+
+    let mut names: Vec<_> = cfg.sites.keys().cloned().collect();
+    names.sort();
+    for name in names {
+        let site = &cfg.sites[&name];
+        let marker = if cfg.default_site.as_deref() == Some(&name) {
+            " *"
+        } else {
+            ""
+        };
+        println!("{}{}", name, marker);
+        println!("  domain:  {}", site.domain);
+        println!("  api key: {}", format_api_key(Some(&site.api_key)));
+        println!("  region:  {}", region_label(site.region));
+    }
+    Ok(())
+}
+
+fn config_set_default(name: String) -> Result<()> {
+    let mut cfg = config::load_config()?;
+    if !cfg.sites.contains_key(&name) {
+        anyhow::bail!("Site '{}' not found. Available: {}", name, cfg.list_sites());
+    }
+    cfg.default_site = Some(name.clone());
+    config::save_config(&cfg)?;
+    println!("Default site set to '{}'", name);
+    Ok(())
+}
+
+fn config_remove(name: String) -> Result<()> {
+    let mut cfg = config::load_config()?;
+    if cfg.remove_site(&name) {
+        config::save_config(&cfg)?;
+        println!("Site '{}' removed", name);
+    } else {
+        println!("Site '{}' not found", name);
+    }
+    Ok(())
+}
+
+fn format_api_key(api_key: Option<&str>) -> String {
+    let Some(key) = api_key else {
+        return "(not set)".to_string();
+    };
+    if key.len() > 8 {
+        return format!("{}...{}", &key[..4], &key[key.len() - 4..]);
+    }
+    "*".repeat(key.len())
+}
+
+fn region_label(region: Region) -> &'static str {
+    match region {
+        Region::Us => "us",
+        Region::Eu => "eu",
+    }
+}
+
+fn parse_region(region: &str) -> Result<Region> {
+    match region.to_lowercase().as_str() {
+        "us" => Ok(Region::Us),
+        "eu" => Ok(Region::Eu),
+        _ => anyhow::bail!("Invalid region '{}'. Use 'us' or 'eu'.", region),
+    }
+}
+
+async fn run_command(command: Commands, site: Option<&str>) -> Result<()> {
+    match command {
         Commands::Events {
             event,
             recipient,
             limit,
             json,
-        } => run_events(event, recipient, limit, json).await,
+        } => run_events(site, event, recipient, limit, json).await,
         Commands::Message {
             storage_url,
             json,
             headers,
-        } => run_message(storage_url, json, headers).await,
+        } => run_message(site, storage_url, json, headers).await,
         Commands::Bounces {
             limit,
             json,
             command,
-        } => run_bounces(limit, json, command).await,
+        } => run_bounces(site, limit, json, command).await,
         Commands::Complaints {
             limit,
             json,
             command,
-        } => run_complaints(limit, json, command).await,
+        } => run_complaints(site, limit, json, command).await,
         Commands::Unsubscribes {
             limit,
             json,
             command,
-        } => run_unsubscribes(limit, json, command).await,
-        Commands::Stats { duration, json } => run_stats(duration, json).await,
-        Commands::Config {
-            api_key,
-            domain,
-            region,
-        } => run_config(api_key, domain, region).await,
+        } => run_unsubscribes(site, limit, json, command).await,
+        Commands::Stats { duration, json } => run_stats(site, duration, json).await,
+        Commands::Config { action } => run_config(action),
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    run_command(cli.command, cli.site.as_deref()).await
 }
