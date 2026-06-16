@@ -25,10 +25,21 @@ fn is_transient_error(err: &reqwest::Error) -> bool {
 }
 
 trait Paginated {
-    fn paging(&self) -> Option<&Paging>;
-    fn set_paging(&mut self, paging: Option<Paging>);
-    fn extend_items(&mut self, other: Self);
-    fn items_empty(other: &Self) -> bool;
+    fn paging(&self) -> Option<&Paging> {
+        None
+    }
+
+    fn set_paging(&mut self, _paging: Option<Paging>) {}
+
+    fn extend_items(&mut self, _other: Self)
+    where
+        Self: Sized,
+    {
+    }
+
+    fn items_empty(_other: &Self) -> bool {
+        true
+    }
 }
 
 impl Client {
@@ -103,6 +114,12 @@ impl Client {
 
     async fn get(&self, endpoint: &str) -> Result<Value> {
         let url = format!("{}{}", self.base_url, endpoint);
+        self.fetch_json(&url).await
+    }
+
+    /// GET against the v4 API (the domains endpoint lives on v4, not v3).
+    async fn get_v4(&self, endpoint: &str) -> Result<Value> {
+        let url = format!("{}{}", self.base_url.replace("/v3", "/v4"), endpoint);
         self.fetch_json(&url).await
     }
 
@@ -228,6 +245,32 @@ impl Client {
     /// Fetch a stored message by its storage URL
     pub async fn fetch_stored_message(&self, storage_url: &str) -> Result<StoredMessage> {
         let value = self.fetch_json(storage_url).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// List all IP addresses on the account, optionally only dedicated ones
+    pub async fn list_account_ips(&self, dedicated: bool) -> Result<IpsResponse> {
+        let query = if dedicated { "?dedicated=true" } else { "" };
+        let value = self.get(&format!("/ips{}", query)).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// List IP addresses assigned to a domain (defaults to the configured one)
+    pub async fn list_domain_ips(&self, domain: Option<&str>) -> Result<IpsResponse> {
+        let domain = domain.unwrap_or(&self.domain);
+        let value = self.get(&format!("/domains/{}/ips", domain)).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// List all domains on the account
+    pub async fn list_domains(&self, limit: u32) -> Result<DomainsResponse> {
+        let value = self.get_v4(&format!("/domains?limit={}", limit)).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Get details for a single IP address
+    pub async fn get_ip(&self, ip: &str) -> Result<IpDetails> {
+        let value = self.get(&format!("/ips/{}", ip)).await?;
         Ok(serde_json::from_value(value)?)
     }
 }
@@ -438,6 +481,47 @@ pub struct StoredMessageHeaders {
     /// Other headers not explicitly parsed
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub other: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct IpsResponse {
+    // Mailgun returns `null` (not an empty array) when there are no items,
+    // so accept both null and missing as an empty list.
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
+    pub items: Vec<String>,
+    pub total_count: Option<u32>,
+}
+
+fn deserialize_null_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DomainsResponse {
+    #[serde(default)]
+    pub items: Vec<Domain>,
+    pub total_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Domain {
+    pub name: String,
+    pub state: Option<String>,
+    #[serde(rename = "type")]
+    pub domain_type: Option<String>,
+    #[serde(default)]
+    pub is_disabled: bool,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct IpDetails {
+    pub ip: String,
+    pub rdns: Option<String>,
+    pub dedicated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

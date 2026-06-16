@@ -90,6 +90,32 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List sending IP addresses (account or domain-assigned)
+    Ips {
+        /// Show details for a single IP address instead of listing
+        ip: Option<String>,
+        /// List all account IPs instead of just this domain's assigned IPs
+        #[arg(short, long)]
+        all: bool,
+        /// Only show dedicated IPs (implies --all)
+        #[arg(long)]
+        dedicated: bool,
+        /// Query a specific domain's assigned IPs instead of the configured one
+        #[arg(long)]
+        domain: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List domains on the account
+    Domains {
+        /// Number of results to return
+        #[arg(short = 'n', long, default_value = "100")]
+        limit: u32,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage configured sites (credentials per Mailgun account/domain)
     Config {
         #[command(subcommand)]
@@ -560,6 +586,103 @@ async fn run_unsubscribes(
     Ok(())
 }
 
+fn print_ips(resp: &api::IpsResponse) {
+    if resp.items.is_empty() {
+        println!("No IP addresses found.");
+        return;
+    }
+    for ip in &resp.items {
+        println!("{}", ip);
+    }
+    if let Some(total) = resp.total_count {
+        println!();
+        println!("Total: {}", total);
+    }
+}
+
+fn print_ip_details(ip: &api::IpDetails) {
+    println!("IP:        {}", ip.ip);
+    println!("RDNS:      {}", ip.rdns.as_deref().unwrap_or("-"));
+    let dedicated = match ip.dedicated {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    };
+    println!("Dedicated: {}", dedicated);
+}
+
+async fn run_ips(
+    site: Option<&str>,
+    ip: Option<String>,
+    all: bool,
+    dedicated: bool,
+    domain: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let client = get_client(site)?;
+
+    if let Some(ip) = ip {
+        let details = client.get_ip(&ip).await?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&details)?);
+        } else {
+            print_ip_details(&details);
+        }
+        return Ok(());
+    }
+
+    // `--dedicated` is an account-level filter, so it implies `--all`.
+    let resp = if all || dedicated {
+        client.list_account_ips(dedicated).await?
+    } else {
+        client.list_domain_ips(domain.as_deref()).await?
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else {
+        print_ips(&resp);
+    }
+    Ok(())
+}
+
+fn print_domains(resp: &api::DomainsResponse) {
+    if resp.items.is_empty() {
+        println!("No domains found.");
+        return;
+    }
+
+    println!("{:<32} {:<10} {:<10} CREATED", "NAME", "STATE", "TYPE");
+    println!("{}", "-".repeat(80));
+
+    for domain in &resp.items {
+        let name = if domain.is_disabled {
+            format!("{} (disabled)", domain.name)
+        } else {
+            domain.name.clone()
+        };
+        println!(
+            "{:<32} {:<10} {:<10} {}",
+            name,
+            domain.state.as_deref().unwrap_or("-"),
+            domain.domain_type.as_deref().unwrap_or("-"),
+            domain.created_at.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+async fn run_domains(site: Option<&str>, limit: u32, json: bool) -> Result<()> {
+    let client = get_client(site)?;
+    let resp = client.list_domains(limit).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else {
+        print_domains(&resp);
+    }
+    Ok(())
+}
+
 async fn run_stats(site: Option<&str>, duration: String, json: bool) -> Result<()> {
     let client = get_client(site)?;
     let event_types = [
@@ -745,6 +868,14 @@ async fn run_command(command: Commands, site: Option<&str>) -> Result<()> {
             command,
         } => run_unsubscribes(site, limit, json, command).await,
         Commands::Stats { duration, json } => run_stats(site, duration, json).await,
+        Commands::Ips {
+            ip,
+            all,
+            dedicated,
+            domain,
+            json,
+        } => run_ips(site, ip, all, dedicated, domain, json).await,
+        Commands::Domains { limit, json } => run_domains(site, limit, json).await,
         Commands::Config { action } => run_config(action),
     }
 }
