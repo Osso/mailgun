@@ -188,6 +188,10 @@ enum UnsubscribesCommands {
 fn get_client(site: Option<&str>) -> Result<api::Client> {
     let cfg = config::load_config()?;
     let resolved = cfg.resolve_site(site)?;
+    #[cfg(test)]
+    if let Ok(base_url) = std::env::var("MAILGUN_TEST_BASE_URL") {
+        return api::Client::with_base_url(&resolved.api_key, &resolved.domain, base_url);
+    }
     api::Client::new(&resolved.api_key, &resolved.domain, resolved.region)
 }
 
@@ -852,6 +856,24 @@ async fn run_command(command: Commands, site: Option<&str>) -> Result<()> {
             json,
             headers,
         } => run_message(site, storage_url, json, headers).await,
+        Commands::Bounces { .. } | Commands::Complaints { .. } | Commands::Unsubscribes { .. } => {
+            run_suppression_command(command, site).await
+        }
+        Commands::Stats { duration, json } => run_stats(site, duration, json).await,
+        Commands::Ips {
+            ip,
+            all,
+            dedicated,
+            domain,
+            json,
+        } => run_ips(site, ip, all, dedicated, domain, json).await,
+        Commands::Domains { limit, json } => run_domains(site, limit, json).await,
+        Commands::Config { action } => run_config(action),
+    }
+}
+
+async fn run_suppression_command(command: Commands, site: Option<&str>) -> Result<()> {
+    match command {
         Commands::Bounces {
             limit,
             json,
@@ -867,16 +889,7 @@ async fn run_command(command: Commands, site: Option<&str>) -> Result<()> {
             json,
             command,
         } => run_unsubscribes(site, limit, json, command).await,
-        Commands::Stats { duration, json } => run_stats(site, duration, json).await,
-        Commands::Ips {
-            ip,
-            all,
-            dedicated,
-            domain,
-            json,
-        } => run_ips(site, ip, all, dedicated, domain, json).await,
-        Commands::Domains { limit, json } => run_domains(site, limit, json).await,
-        Commands::Config { action } => run_config(action),
+        _ => unreachable!("only suppression commands are delegated here"),
     }
 }
 
@@ -890,6 +903,178 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::net::SocketAddr;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_temp_config(test: impl FnOnce()) {
+        let guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let dir = tempdir().unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+
+        test();
+
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        drop(guard);
+    }
+
+    struct CliMockServer {
+        base_url: String,
+        requests: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CliMockServer {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let server_requests = std::sync::Arc::clone(&requests);
+
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let requests = std::sync::Arc::clone(&server_requests);
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0; 4096];
+                        let bytes_read = stream.read(&mut buffer).await.unwrap();
+                        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                        let request_line = request.lines().next().unwrap_or_default().to_string();
+                        let body = cli_response_body(&request_line);
+                        requests.lock().unwrap().push(request_line);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    });
+                }
+            });
+
+            Self {
+                base_url: format!("http://{}/v3", display_addr(addr)),
+                requests,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn display_addr(addr: SocketAddr) -> String {
+        format!("{}:{}", addr.ip(), addr.port())
+    }
+
+    fn cli_response_body(request_line: &str) -> &'static str {
+        let path = request_line.split_whitespace().nth(1).unwrap_or_default();
+        cli_response_for_path(path).unwrap_or(r#"{}"#)
+    }
+
+    fn cli_response_for_path(path: &str) -> Option<&'static str> {
+        cli_suppression_response(path)
+            .or_else(|| cli_stats_response(path))
+            .or_else(|| cli_message_response(path))
+            .or_else(|| cli_ip_response(path))
+            .or_else(|| cli_domain_response(path))
+    }
+
+    fn cli_suppression_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v3/example.com/events?limit=2&event=failed&recipient=reader@example.com" => Some(
+                r#"{"items":[{"event":"failed","timestamp":1710000000,"recipient":"reader@example.com"}],"paging":{"next":null,"previous":null}}"#,
+            ),
+            "/v3/example.com/bounces?limit=1" => Some(
+                r#"{"items":[{"address":"bad@example.com","code":"550","error":"blocked","created_at":"2026-01-01"}],"paging":null}"#,
+            ),
+            "/v3/example.com/complaints?limit=1" => Some(
+                r#"{"items":[{"address":"spam@example.com","created_at":"2026-01-02"}],"paging":null}"#,
+            ),
+            "/v3/example.com/unsubscribes?limit=1" => Some(
+                r#"{"items":[{"address":"gone@example.com","tags":["news"],"created_at":"2026-01-03"}],"paging":null}"#,
+            ),
+            "/v3/example.com/bounces/bad@example.com"
+            | "/v3/example.com/complaints/spam@example.com"
+            | "/v3/example.com/unsubscribes/gone@example.com" => Some(r#"{"deleted":true}"#),
+            _ => None,
+        }
+    }
+
+    fn cli_stats_response(path: &str) -> Option<&'static str> {
+        let stats_path = "/v3/example.com/stats/total?event=accepted,delivered,failed,opened,clicked,unsubscribed,complained&duration=7d";
+        if path != stats_path {
+            return None;
+        }
+        Some(
+            r#"{"start":"2026-01-01","end":"2026-01-08","resolution":"day","stats":[{"time":"2026-01-01","accepted":{"total":3},"delivered":{"total":2}}]}"#,
+        )
+    }
+
+    fn cli_message_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v3/message" => Some(
+                r#"{"message-headers":[["Received","mx1"]],"From":"sender@example.com","To":"reader@example.com","Subject":"Stored","stripped-text":"Body","attachments":[]}"#,
+            ),
+            _ => None,
+        }
+    }
+
+    fn cli_ip_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v3/ips" => Some(r#"{"items":["1.2.3.4"],"total_count":1}"#),
+            "/v3/ips?dedicated=true" => Some(r#"{"items":["5.6.7.8"],"total_count":1}"#),
+            "/v3/domains/example.com/ips" => Some(r#"{"items":["9.9.9.9"],"total_count":1}"#),
+            "/v3/domains/other.com/ips" => Some(r#"{"items":["8.8.8.8"],"total_count":1}"#),
+            "/v3/ips/1.2.3.4" => {
+                Some(r#"{"ip":"1.2.3.4","rdns":"mail.example.com","dedicated":true}"#)
+            }
+            _ => None,
+        }
+    }
+
+    fn cli_domain_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v4/domains?limit=5" => Some(
+                r#"{"items":[{"name":"example.com","state":"active","type":"sandbox","is_disabled":false,"created_at":"2026-01-01"}],"total_count":1}"#,
+            ),
+            _ => None,
+        }
+    }
+
+    fn configure_mocked_site(base_url: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            std::env::set_var("MAILGUN_TEST_BASE_URL", base_url);
+        }
+        run_config(Some(ConfigCommands::Set {
+            name: "prod".to_string(),
+            api_key: "key-prod".to_string(),
+            domain: "example.com".to_string(),
+            region: "us".to_string(),
+            default: true,
+        }))
+        .unwrap();
+        dir
+    }
+
+    fn clear_mocked_site_env() {
+        unsafe {
+            std::env::remove_var("MAILGUN_TEST_BASE_URL");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
 
     #[test]
     fn parses_global_site_and_nested_delete_commands() {
@@ -1155,5 +1340,581 @@ mod tests {
         assert_eq!(parse_region("US").unwrap(), Region::Us);
         assert_eq!(parse_region("eu").unwrap(), Region::Eu);
         assert!(parse_region("ap").is_err());
+    }
+
+    #[test]
+    fn config_commands_persist_default_and_removed_sites() {
+        with_temp_config(|| {
+            run_config(Some(ConfigCommands::Set {
+                name: "prod".to_string(),
+                api_key: "key-prod".to_string(),
+                domain: "mg.example.com".to_string(),
+                region: "eu".to_string(),
+                default: true,
+            }))
+            .unwrap();
+            run_config(Some(ConfigCommands::Set {
+                name: "dev".to_string(),
+                api_key: "key-dev".to_string(),
+                domain: "dev.example.com".to_string(),
+                region: "us".to_string(),
+                default: false,
+            }))
+            .unwrap();
+
+            let cfg = config::load_config().unwrap();
+            assert_eq!(cfg.default_site.as_deref(), Some("prod"));
+            assert_eq!(cfg.sites["prod"].region, Region::Eu);
+            assert_eq!(cfg.sites["dev"].domain, "dev.example.com");
+
+            run_config(Some(ConfigCommands::Default {
+                name: "dev".to_string(),
+            }))
+            .unwrap();
+            assert_eq!(
+                config::load_config().unwrap().default_site.as_deref(),
+                Some("dev")
+            );
+
+            run_config(Some(ConfigCommands::Remove {
+                name: "prod".to_string(),
+            }))
+            .unwrap();
+            let cfg = config::load_config().unwrap();
+            assert!(!cfg.sites.contains_key("prod"));
+            assert_eq!(cfg.default_site.as_deref(), Some("dev"));
+        });
+    }
+
+    #[test]
+    fn config_commands_handle_list_path_missing_remove_and_bad_default() {
+        with_temp_config(|| {
+            run_config(None).unwrap();
+            run_config(Some(ConfigCommands::List)).unwrap();
+            run_config(Some(ConfigCommands::Path)).unwrap();
+
+            run_config(Some(ConfigCommands::Remove {
+                name: "missing".to_string(),
+            }))
+            .unwrap();
+            assert!(config::load_config().unwrap().sites.is_empty());
+
+            let err = run_config(Some(ConfigCommands::Default {
+                name: "missing".to_string(),
+            }))
+            .unwrap_err();
+            assert!(err.to_string().contains("Site 'missing' not found"));
+        });
+    }
+
+    #[test]
+    fn print_functions_handle_empty_and_populated_payloads() {
+        let result = std::panic::catch_unwind(|| {
+            print_events(api::EventsResponse {
+                items: Vec::new(),
+                paging: None,
+            });
+            print_events(api::EventsResponse {
+                items: vec![
+                    api::Event {
+                        id: Some("evt-1".to_string()),
+                        event: "failed".to_string(),
+                        timestamp: 1710000000.0,
+                        recipient: Some("reader@example.com".to_string()),
+                        message: Some(api::MessageInfo {
+                            headers: Some(api::MessageHeaders {
+                                message_id: Some("msg-1".to_string()),
+                                subject: Some(
+                                    "A subject that is intentionally longer than forty characters"
+                                        .to_string(),
+                                ),
+                                from: Some("sender@example.com".to_string()),
+                                to: Some("reader@example.com".to_string()),
+                            }),
+                        }),
+                        tags: vec!["news".to_string()],
+                        delivery_status: Some(api::DeliveryStatus {
+                            code: Some(550),
+                            message: Some("Mailbox unavailable".to_string()),
+                            description: None,
+                        }),
+                        reason: None,
+                        severity: Some("permanent".to_string()),
+                        storage: Some(api::StorageInfo {
+                            url: "https://storage".to_string(),
+                        }),
+                    },
+                    api::Event {
+                        id: None,
+                        event: "rejected".to_string(),
+                        timestamp: 1710000001.0,
+                        recipient: None,
+                        message: None,
+                        tags: Vec::new(),
+                        delivery_status: None,
+                        reason: Some("policy".to_string()),
+                        severity: None,
+                        storage: None,
+                    },
+                ],
+                paging: None,
+            });
+
+            print_bounces(api::BouncesResponse {
+                items: Vec::new(),
+                paging: None,
+            });
+            print_bounces(api::BouncesResponse {
+                items: vec![api::Bounce {
+                    address: "bad@example.com".to_string(),
+                    code: "550".to_string(),
+                    error: "blocked because this address repeatedly failed delivery".to_string(),
+                    created_at: "2026-01-01".to_string(),
+                }],
+                paging: None,
+            });
+
+            print_complaints(api::ComplaintsResponse {
+                items: Vec::new(),
+                paging: None,
+            });
+            print_complaints(api::ComplaintsResponse {
+                items: vec![api::Complaint {
+                    address: "spam@example.com".to_string(),
+                    created_at: "2026-01-02".to_string(),
+                }],
+                paging: None,
+            });
+
+            print_unsubscribes(api::UnsubscribesResponse {
+                items: Vec::new(),
+                paging: None,
+            });
+            print_unsubscribes(api::UnsubscribesResponse {
+                items: vec![
+                    api::Unsubscribe {
+                        address: "tagged@example.com".to_string(),
+                        tags: vec!["newsletter".to_string(), "promo".to_string()],
+                        created_at: "2026-01-03".to_string(),
+                    },
+                    api::Unsubscribe {
+                        address: "untagged@example.com".to_string(),
+                        tags: Vec::new(),
+                        created_at: "2026-01-04".to_string(),
+                    },
+                ],
+                paging: None,
+            });
+
+            print_ips(&api::IpsResponse {
+                items: Vec::new(),
+                total_count: None,
+            });
+            print_ips(&api::IpsResponse {
+                items: vec!["1.2.3.4".to_string()],
+                total_count: Some(1),
+            });
+            print_ip_details(&api::IpDetails {
+                ip: "1.2.3.4".to_string(),
+                rdns: Some("mail.example.com".to_string()),
+                dedicated: Some(true),
+            });
+            print_ip_details(&api::IpDetails {
+                ip: "5.6.7.8".to_string(),
+                rdns: None,
+                dedicated: Some(false),
+            });
+            print_ip_details(&api::IpDetails {
+                ip: "9.9.9.9".to_string(),
+                rdns: None,
+                dedicated: None,
+            });
+
+            print_domains(&api::DomainsResponse {
+                items: Vec::new(),
+                total_count: None,
+            });
+            print_domains(&api::DomainsResponse {
+                items: vec![
+                    api::Domain {
+                        name: "example.com".to_string(),
+                        state: Some("active".to_string()),
+                        domain_type: Some("custom".to_string()),
+                        is_disabled: false,
+                        created_at: Some("2026-01-01".to_string()),
+                    },
+                    api::Domain {
+                        name: "disabled.example.com".to_string(),
+                        state: None,
+                        domain_type: None,
+                        is_disabled: true,
+                        created_at: None,
+                    },
+                ],
+                total_count: Some(2),
+            });
+        });
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_message_and_stats_handle_optional_and_truncated_fields() {
+        let long_text = "x".repeat(MESSAGE_PREVIEW_CHARS + 10);
+        let result = std::panic::catch_unwind(|| {
+            let message = api::StoredMessage {
+                headers: api::StoredMessageHeaders {
+                    received: vec!["mx1".to_string(), "mx2".to_string()],
+                    dkim: Some("dkim".to_string()),
+                    mime_version: Some("1.0".to_string()),
+                    content_transfer_encoding: Some("quoted-printable".to_string()),
+                    list_unsubscribe: Some("<mailto:unsubscribe@example.com>".to_string()),
+                    list_unsubscribe_post: Some("List-Unsubscribe=One-Click".to_string()),
+                    other: vec![("X-Campaign".to_string(), "summer".to_string())],
+                },
+                from: Some("sender@example.com".to_string()),
+                to: Some("reader@example.com".to_string()),
+                subject: Some("Stored".to_string()),
+                stripped_text: Some(long_text),
+                stripped_html: Some("<p>Body</p>".to_string()),
+                stripped_signature: None,
+                attachments: vec![api::AttachmentInfo {
+                    filename: "report.pdf".to_string(),
+                    size: 2048,
+                    content_type: "application/pdf".to_string(),
+                }],
+            };
+
+            print_message(&message, true);
+            print_message(&message, false);
+            print_message_text(None);
+            print_message_text(Some("short body"));
+
+            print_stats(api::StatsResponse {
+                start: "2026-01-01".to_string(),
+                end: "2026-01-08".to_string(),
+                resolution: "day".to_string(),
+                stats: vec![api::StatEntry {
+                    time: "2026-01-01".to_string(),
+                    accepted: Some(api::StatCount {
+                        total: Some(10),
+                        permanent: None,
+                        temporary: None,
+                    }),
+                    delivered: Some(api::StatCount {
+                        total: Some(5),
+                        permanent: None,
+                        temporary: None,
+                    }),
+                    failed: Some(api::StatCount {
+                        total: Some(1),
+                        permanent: Some(1),
+                        temporary: Some(0),
+                    }),
+                    opened: Some(api::StatCount {
+                        total: Some(2),
+                        permanent: None,
+                        temporary: None,
+                    }),
+                    clicked: Some(api::StatCount {
+                        total: Some(1),
+                        permanent: None,
+                        temporary: None,
+                    }),
+                    unsubscribed: Some(api::StatCount {
+                        total: Some(1),
+                        permanent: None,
+                        temporary: None,
+                    }),
+                    complained: Some(api::StatCount {
+                        total: Some(1),
+                        permanent: None,
+                        temporary: None,
+                    }),
+                    stored: None,
+                }],
+            });
+        });
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_functions_call_expected_mailgun_endpoints() {
+        let guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let server = CliMockServer::start().await;
+        let _dir = configure_mocked_site(&server.base_url);
+
+        run_event_and_message_paths(&server).await;
+        run_suppression_paths().await;
+        run_ip_domain_and_stats_paths().await;
+        assert_run_function_requests(&server.requests());
+
+        clear_mocked_site_env();
+        drop(guard);
+    }
+
+    async fn run_event_and_message_paths(server: &CliMockServer) {
+        run_events(
+            None,
+            Some("failed".to_string()),
+            Some("reader@example.com".to_string()),
+            2,
+            false,
+        )
+        .await
+        .unwrap();
+        run_events(
+            None,
+            Some("failed".to_string()),
+            Some("reader@example.com".to_string()),
+            2,
+            true,
+        )
+        .await
+        .unwrap();
+        run_message(None, format!("{}/message", server.base_url), false, false)
+            .await
+            .unwrap();
+        run_message(None, format!("{}/message", server.base_url), true, true)
+            .await
+            .unwrap();
+    }
+
+    async fn run_suppression_paths() {
+        run_bounces(None, 1, false, None).await.unwrap();
+        run_bounces(
+            None,
+            1,
+            true,
+            Some(BouncesCommands::Delete {
+                email: "bad@example.com".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        run_complaints(None, 1, false, None).await.unwrap();
+        run_complaints(
+            None,
+            1,
+            true,
+            Some(ComplaintsCommands::Delete {
+                email: "spam@example.com".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        run_unsubscribes(None, 1, false, None).await.unwrap();
+        run_unsubscribes(
+            None,
+            1,
+            true,
+            Some(UnsubscribesCommands::Delete {
+                email: "gone@example.com".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn run_ip_domain_and_stats_paths() {
+        run_ips(None, None, false, false, None, false)
+            .await
+            .unwrap();
+        run_ips(None, None, true, false, None, true).await.unwrap();
+        run_ips(None, None, false, true, None, false).await.unwrap();
+        run_ips(
+            None,
+            None,
+            false,
+            false,
+            Some("other.com".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        run_ips(None, Some("1.2.3.4".to_string()), false, false, None, false)
+            .await
+            .unwrap();
+        run_ips(None, Some("1.2.3.4".to_string()), false, false, None, true)
+            .await
+            .unwrap();
+        run_domains(None, 5, false).await.unwrap();
+        run_domains(None, 5, true).await.unwrap();
+        run_stats(None, "7d".to_string(), false).await.unwrap();
+        run_stats(None, "7d".to_string(), true).await.unwrap();
+    }
+
+    fn assert_run_function_requests(requests: &[String]) {
+        assert!(requests.contains(
+            &"GET /v3/example.com/events?limit=2&event=failed&recipient=reader@example.com HTTP/1.1"
+                .to_string()
+        ));
+        assert!(requests.contains(&"GET /v3/message HTTP/1.1".to_string()));
+        assert!(
+            requests
+                .contains(&"DELETE /v3/example.com/bounces/bad@example.com HTTP/1.1".to_string())
+        );
+        assert!(
+            requests.contains(
+                &"DELETE /v3/example.com/complaints/spam@example.com HTTP/1.1".to_string()
+            )
+        );
+        assert!(requests.contains(
+            &"DELETE /v3/example.com/unsubscribes/gone@example.com HTTP/1.1".to_string()
+        ));
+        assert!(
+            requests.contains(&"GET /v3/example.com/stats/total?event=accepted,delivered,failed,opened,clicked,unsubscribed,complained&duration=7d HTTP/1.1".to_string())
+        );
+        assert!(requests.contains(&"GET /v3/domains/example.com/ips HTTP/1.1".to_string()));
+        assert!(requests.contains(&"GET /v3/domains/other.com/ips HTTP/1.1".to_string()));
+        assert!(requests.contains(&"GET /v3/ips HTTP/1.1".to_string()));
+        assert!(requests.contains(&"GET /v3/ips?dedicated=true HTTP/1.1".to_string()));
+        assert!(requests.contains(&"GET /v3/ips/1.2.3.4 HTTP/1.1".to_string()));
+        assert!(requests.contains(&"GET /v4/domains?limit=5 HTTP/1.1".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_command_dispatches_config_and_api_commands() {
+        let guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let server = CliMockServer::start().await;
+        let _dir = configure_mocked_site(&server.base_url);
+
+        run_core_commands(&server).await;
+        run_collection_commands().await;
+        run_report_commands().await;
+        assert_command_requests(&server.requests());
+
+        clear_mocked_site_env();
+        drop(guard);
+    }
+
+    async fn run_core_commands(server: &CliMockServer) {
+        run_command(
+            Commands::Events {
+                event: Some("failed".to_string()),
+                recipient: Some("reader@example.com".to_string()),
+                limit: 2,
+                json: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        run_command(
+            Commands::Message {
+                storage_url: format!("{}/message", server.base_url),
+                json: false,
+                headers: true,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn run_collection_commands() {
+        run_command(
+            Commands::Bounces {
+                limit: 1,
+                json: false,
+                command: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        run_command(
+            Commands::Complaints {
+                limit: 1,
+                json: false,
+                command: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        run_command(
+            Commands::Unsubscribes {
+                limit: 1,
+                json: false,
+                command: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn run_report_commands() {
+        run_command(
+            Commands::Ips {
+                ip: Some("1.2.3.4".to_string()),
+                all: false,
+                dedicated: false,
+                domain: None,
+                json: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        run_command(
+            Commands::Domains {
+                limit: 5,
+                json: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        run_command(
+            Commands::Stats {
+                duration: "7d".to_string(),
+                json: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        run_command(
+            Commands::Config {
+                action: Some(ConfigCommands::Path),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn assert_command_requests(requests: &[String]) {
+        assert!(requests.iter().any(|request| request.contains("/events")));
+        assert!(requests.iter().any(|request| request.contains("/message")));
+        assert!(requests.iter().any(|request| request.contains("/bounces")));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("/complaints"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("/unsubscribes"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("/ips/1.2.3.4"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("/domains?limit=5"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("/stats/total"))
+        );
     }
 }

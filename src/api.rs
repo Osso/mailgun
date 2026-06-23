@@ -57,7 +57,7 @@ impl Client {
     }
 
     #[cfg(test)]
-    fn with_base_url(api_key: &str, domain: &str, base_url: String) -> Result<Self> {
+    pub(crate) fn with_base_url(api_key: &str, domain: &str, base_url: String) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
