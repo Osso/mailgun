@@ -56,6 +56,20 @@ impl Client {
         })
     }
 
+    #[cfg(test)]
+    fn with_base_url(api_key: &str, domain: &str, base_url: String) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
+        Ok(Self {
+            http,
+            base_url,
+            api_key: api_key.to_string(),
+            domain: domain.to_string(),
+        })
+    }
+
     async fn send_with_retry<F, Fut>(
         &self,
         make_request: F,
@@ -530,4 +544,388 @@ pub struct AttachmentInfo {
     pub size: u64,
     #[serde(rename = "content-type")]
     pub content_type: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct MockServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockServer {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = Arc::clone(&requests);
+
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let requests = Arc::clone(&server_requests);
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0; 4096];
+                        let bytes_read = stream.read(&mut buffer).await.unwrap();
+                        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                        let request_line = request.lines().next().unwrap_or_default().to_string();
+                        let body = response_body(&request_line);
+                        requests.lock().unwrap().push(request_line);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    });
+                }
+            });
+
+            Self {
+                base_url: format!("http://{}/v3", display_addr(addr)),
+                requests,
+            }
+        }
+
+        fn client(&self) -> Client {
+            Client::with_base_url("key-test", "example.com", self.base_url.clone()).unwrap()
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn display_addr(addr: SocketAddr) -> String {
+        format!("{}:{}", addr.ip(), addr.port())
+    }
+
+    fn response_body(request_line: &str) -> &'static str {
+        let path = request_line.split_whitespace().nth(1).unwrap_or_default();
+        response_for_path(path).unwrap_or(r#"{}"#)
+    }
+
+    fn response_for_path(path: &str) -> Option<&'static str> {
+        suppression_response(path)
+            .or_else(|| stats_response(path))
+            .or_else(|| message_response(path))
+            .or_else(|| ip_response(path))
+            .or_else(|| domain_response(path))
+    }
+
+    fn suppression_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v3/example.com/events?limit=2&event=failed&recipient=reader@example.com" => Some(
+                r#"{"items":[{"event":"failed","timestamp":1710000000,"recipient":"reader@example.com"}],"paging":{"next":null,"previous":null}}"#,
+            ),
+            "/v3/example.com/bounces?limit=1" => Some(
+                r#"{"items":[{"address":"bad@example.com","code":"550","error":"blocked","created_at":"2026-01-01"}],"paging":null}"#,
+            ),
+            "/v3/example.com/complaints?limit=1" => Some(
+                r#"{"items":[{"address":"spam@example.com","created_at":"2026-01-02"}],"paging":null}"#,
+            ),
+            "/v3/example.com/unsubscribes?limit=1" => Some(
+                r#"{"items":[{"address":"gone@example.com","tags":["news"],"created_at":"2026-01-03"}],"paging":null}"#,
+            ),
+            "/v3/example.com/bounces/bad@example.com"
+            | "/v3/example.com/complaints/spam@example.com"
+            | "/v3/example.com/unsubscribes/gone@example.com" => Some(r#"{"deleted":true}"#),
+            _ => None,
+        }
+    }
+
+    fn stats_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v3/example.com/stats/total?event=accepted,delivered&duration=7d" => Some(
+                r#"{"start":"2026-01-01","end":"2026-01-08","resolution":"day","stats":[{"time":"2026-01-01","accepted":{"total":3},"delivered":{"total":2}}]}"#,
+            ),
+            _ => None,
+        }
+    }
+
+    fn message_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v3/message" => Some(
+                r#"{"message-headers":[["Received","mx1"]],"From":"sender@example.com","To":"reader@example.com","Subject":"Stored","stripped-text":"Body","attachments":[]}"#,
+            ),
+            _ => None,
+        }
+    }
+
+    fn ip_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v3/ips" => Some(r#"{"items":["1.2.3.4"],"total_count":1}"#),
+            "/v3/ips?dedicated=true" => Some(r#"{"items":["5.6.7.8"],"total_count":1}"#),
+            "/v3/domains/example.com/ips" => Some(r#"{"items":["9.9.9.9"],"total_count":1}"#),
+            "/v3/domains/other.com/ips" => Some(r#"{"items":["8.8.8.8"],"total_count":1}"#),
+            "/v3/ips/1.2.3.4" => {
+                Some(r#"{"ip":"1.2.3.4","rdns":"mail.example.com","dedicated":true}"#)
+            }
+            _ => None,
+        }
+    }
+
+    fn domain_response(path: &str) -> Option<&'static str> {
+        match path {
+            "/v4/domains?limit=5" => Some(
+                r#"{"items":[{"name":"example.com","state":"active","type":"sandbox","is_disabled":false,"created_at":"2026-01-01"}],"total_count":1}"#,
+            ),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn rejects_event_limits_above_mailgun_maximum_before_requesting() {
+        let client = Client::new("key-test", "example.com", Region::Us).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(client.list_events(None, None, EVENTS_MAX_LIMIT + 1))
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Limit exceeds maximum allowed by Mailgun API (300)")
+        );
+    }
+
+    #[test]
+    fn parses_stored_message_headers_into_known_and_other_groups() {
+        let message: StoredMessage = serde_json::from_value(json!({
+            "message-headers": [
+                ["Received", "mx1"],
+                ["DKIM-Signature", "dkim"],
+                ["Mime-Version", "1.0"],
+                ["Content-Transfer-Encoding", "quoted-printable"],
+                ["List-Unsubscribe", "<mailto:unsubscribe@example.com>"],
+                ["List-Unsubscribe-Post", "List-Unsubscribe=One-Click"],
+                ["X-Campaign", "summer"]
+            ],
+            "From": "sender@example.com",
+            "To": "reader@example.com",
+            "Subject": "Hello",
+            "stripped-text": "Body",
+            "stripped-html": "<p>Body</p>",
+            "stripped-signature": "Sig",
+            "attachments": [{
+                "filename": "report.pdf",
+                "size": 1024,
+                "content-type": "application/pdf"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(message.headers.received, vec!["mx1"]);
+        assert_eq!(message.headers.dkim.as_deref(), Some("dkim"));
+        assert_eq!(message.headers.mime_version.as_deref(), Some("1.0"));
+        assert_eq!(
+            message.headers.content_transfer_encoding.as_deref(),
+            Some("quoted-printable")
+        );
+        assert_eq!(
+            message.headers.list_unsubscribe.as_deref(),
+            Some("<mailto:unsubscribe@example.com>")
+        );
+        assert_eq!(
+            message.headers.list_unsubscribe_post.as_deref(),
+            Some("List-Unsubscribe=One-Click")
+        );
+        assert_eq!(
+            message.headers.other,
+            vec![("X-Campaign".to_string(), "summer".to_string())]
+        );
+        assert_eq!(message.attachments[0].filename, "report.pdf");
+    }
+
+    #[test]
+    fn accepts_null_or_missing_ip_items_as_empty_lists() {
+        let null_items: IpsResponse =
+            serde_json::from_value(json!({"items": null, "total_count": 0})).unwrap();
+        let missing_items: IpsResponse = serde_json::from_value(json!({})).unwrap();
+
+        assert!(null_items.items.is_empty());
+        assert_eq!(null_items.total_count, Some(0));
+        assert!(missing_items.items.is_empty());
+        assert_eq!(missing_items.total_count, None);
+    }
+
+    #[test]
+    fn defaults_optional_collections_when_deserializing_api_records() {
+        let event: Event = serde_json::from_value(json!({
+            "event": "delivered",
+            "timestamp": 1710000000.0,
+            "delivery-status": {"code": 250, "message": "OK"}
+        }))
+        .unwrap();
+        let unsubscribe: Unsubscribe = serde_json::from_value(json!({
+            "address": "reader@example.com",
+            "created_at": "2026-01-01"
+        }))
+        .unwrap();
+        let domain: Domain = serde_json::from_value(json!({
+            "name": "example.com"
+        }))
+        .unwrap();
+
+        assert!(event.tags.is_empty());
+        assert_eq!(event.delivery_status.unwrap().code, Some(250));
+        assert!(unsubscribe.tags.is_empty());
+        assert!(!domain.is_disabled);
+    }
+
+    #[test]
+    fn paginated_response_helpers_merge_items_and_replace_paging() {
+        let mut response = BouncesResponse {
+            items: vec![Bounce {
+                address: "a@example.com".to_string(),
+                code: "550".to_string(),
+                error: "blocked".to_string(),
+                created_at: "2026-01-01".to_string(),
+            }],
+            paging: Some(Paging {
+                next: Some("https://next".to_string()),
+                previous: None,
+            }),
+        };
+        let next_page = BouncesResponse {
+            items: vec![Bounce {
+                address: "b@example.com".to_string(),
+                code: "551".to_string(),
+                error: "invalid".to_string(),
+                created_at: "2026-01-02".to_string(),
+            }],
+            paging: Some(Paging {
+                next: None,
+                previous: Some("https://previous".to_string()),
+            }),
+        };
+
+        assert_eq!(
+            response.paging().and_then(|paging| paging.next.as_deref()),
+            Some("https://next")
+        );
+        assert!(!BouncesResponse::items_empty(&next_page));
+
+        let new_paging = next_page.paging().cloned();
+        response.extend_items(next_page);
+        response.set_paging(new_paging);
+
+        assert_eq!(response.items.len(), 2);
+        assert_eq!(
+            response
+                .paging()
+                .and_then(|paging| paging.previous.as_deref()),
+            Some("https://previous")
+        );
+    }
+
+    #[test]
+    fn paginated_helpers_work_for_suppression_response_types() {
+        let complaints = ComplaintsResponse {
+            items: Vec::new(),
+            paging: None,
+        };
+        let unsubscribes = UnsubscribesResponse {
+            items: Vec::new(),
+            paging: None,
+        };
+
+        assert!(ComplaintsResponse::items_empty(&complaints));
+        assert!(UnsubscribesResponse::items_empty(&unsubscribes));
+    }
+
+    #[tokio::test]
+    async fn client_fetches_events_and_suppression_lists_from_expected_paths() {
+        let server = MockServer::start().await;
+        let client = server.client();
+
+        let events = client
+            .list_events(Some("failed"), Some("reader@example.com"), 2)
+            .await
+            .unwrap();
+        let bounces = client.list_bounces(1).await.unwrap();
+        let complaints = client.list_complaints(1).await.unwrap();
+        let unsubscribes = client.list_unsubscribes(1).await.unwrap();
+
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(events.items[0].event, "failed");
+        assert_eq!(bounces.items[0].address, "bad@example.com");
+        assert_eq!(complaints.items[0].address, "spam@example.com");
+        assert_eq!(unsubscribes.items[0].tags, vec!["news"]);
+        assert!(server
+            .requests()
+            .contains(&"GET /v3/example.com/events?limit=2&event=failed&recipient=reader@example.com HTTP/1.1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn client_deletes_suppression_entries() {
+        let server = MockServer::start().await;
+        let client = server.client();
+
+        assert_eq!(
+            client.delete_bounce("bad@example.com").await.unwrap()["deleted"],
+            true
+        );
+        assert_eq!(
+            client.delete_complaint("spam@example.com").await.unwrap()["deleted"],
+            true
+        );
+        assert_eq!(
+            client.delete_unsubscribe("gone@example.com").await.unwrap()["deleted"],
+            true
+        );
+
+        let requests = server.requests();
+        assert!(
+            requests
+                .contains(&"DELETE /v3/example.com/bounces/bad@example.com HTTP/1.1".to_string())
+        );
+        assert!(
+            requests.contains(
+                &"DELETE /v3/example.com/complaints/spam@example.com HTTP/1.1".to_string()
+            )
+        );
+        assert!(requests.contains(
+            &"DELETE /v3/example.com/unsubscribes/gone@example.com HTTP/1.1".to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_fetches_stats_stored_messages_ips_and_domains() {
+        let server = MockServer::start().await;
+        let client = server.client();
+
+        let stats = client
+            .get_stats(&["accepted", "delivered"], "7d")
+            .await
+            .unwrap();
+        let stored = client
+            .fetch_stored_message(&format!("{}/message", server.base_url))
+            .await
+            .unwrap();
+        let account_ips = client.list_account_ips(false).await.unwrap();
+        let dedicated_ips = client.list_account_ips(true).await.unwrap();
+        let domain_ips = client.list_domain_ips(None).await.unwrap();
+        let other_domain_ips = client.list_domain_ips(Some("other.com")).await.unwrap();
+        let ip = client.get_ip("1.2.3.4").await.unwrap();
+        let domains = client.list_domains(5).await.unwrap();
+
+        assert_eq!(stats.stats[0].accepted.as_ref().unwrap().total, Some(3));
+        assert_eq!(stored.subject.as_deref(), Some("Stored"));
+        assert_eq!(account_ips.items, vec!["1.2.3.4"]);
+        assert_eq!(dedicated_ips.items, vec!["5.6.7.8"]);
+        assert_eq!(domain_ips.items, vec!["9.9.9.9"]);
+        assert_eq!(other_domain_ips.items, vec!["8.8.8.8"]);
+        assert_eq!(ip.rdns.as_deref(), Some("mail.example.com"));
+        assert_eq!(domains.items[0].name, "example.com");
+    }
 }

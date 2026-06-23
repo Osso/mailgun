@@ -885,3 +885,275 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     run_command(cli.command, cli.site.as_deref()).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_global_site_and_nested_delete_commands() {
+        let cli = Cli::try_parse_from([
+            "mailgun",
+            "--site",
+            "prod",
+            "bounces",
+            "--json",
+            "delete",
+            "bad@example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.site.as_deref(), Some("prod"));
+        match cli.command {
+            Commands::Bounces {
+                limit,
+                json,
+                command: Some(BouncesCommands::Delete { email }),
+            } => {
+                assert_eq!(limit, 20);
+                assert!(json);
+                assert_eq!(email, "bad@example.com");
+            }
+            _ => panic!("expected bounces delete command"),
+        }
+    }
+
+    #[test]
+    fn parses_events_message_stats_ips_domains_and_config_commands() {
+        let events = Cli::try_parse_from([
+            "mailgun",
+            "events",
+            "--event",
+            "failed",
+            "--recipient",
+            "reader@example.com",
+            "-n",
+            "25",
+            "--json",
+        ])
+        .unwrap();
+        let message =
+            Cli::try_parse_from(["mailgun", "message", "https://storage", "--headers"]).unwrap();
+        let stats = Cli::try_parse_from(["mailgun", "stats", "--duration", "7d"]).unwrap();
+        let ips =
+            Cli::try_parse_from(["mailgun", "ips", "--all", "--dedicated", "--json"]).unwrap();
+        let domains = Cli::try_parse_from(["mailgun", "domains", "-n", "50"]).unwrap();
+        let config = Cli::try_parse_from([
+            "mailgun",
+            "config",
+            "set",
+            "prod",
+            "--api-key",
+            "key",
+            "--domain",
+            "example.com",
+            "--region",
+            "eu",
+            "--default",
+        ])
+        .unwrap();
+
+        match events.command {
+            Commands::Events {
+                event,
+                recipient,
+                limit,
+                json,
+            } => {
+                assert_eq!(event.as_deref(), Some("failed"));
+                assert_eq!(recipient.as_deref(), Some("reader@example.com"));
+                assert_eq!(limit, 25);
+                assert!(json);
+            }
+            _ => panic!("expected events command"),
+        }
+        match message.command {
+            Commands::Message {
+                storage_url,
+                json,
+                headers,
+            } => {
+                assert_eq!(storage_url, "https://storage");
+                assert!(!json);
+                assert!(headers);
+            }
+            _ => panic!("expected message command"),
+        }
+        match stats.command {
+            Commands::Stats { duration, json } => {
+                assert_eq!(duration, "7d");
+                assert!(!json);
+            }
+            _ => panic!("expected stats command"),
+        }
+        match ips.command {
+            Commands::Ips {
+                ip,
+                all,
+                dedicated,
+                domain,
+                json,
+            } => {
+                assert_eq!(ip, None);
+                assert!(all);
+                assert!(dedicated);
+                assert_eq!(domain, None);
+                assert!(json);
+            }
+            _ => panic!("expected ips command"),
+        }
+        match domains.command {
+            Commands::Domains { limit, json } => {
+                assert_eq!(limit, 50);
+                assert!(!json);
+            }
+            _ => panic!("expected domains command"),
+        }
+        match config.command {
+            Commands::Config {
+                action:
+                    Some(ConfigCommands::Set {
+                        name,
+                        api_key,
+                        domain,
+                        region,
+                        default,
+                    }),
+            } => {
+                assert_eq!(name, "prod");
+                assert_eq!(api_key, "key");
+                assert_eq!(domain, "example.com");
+                assert_eq!(region, "eu");
+                assert!(default);
+            }
+            _ => panic!("expected config set command"),
+        }
+    }
+
+    #[test]
+    fn formats_timestamps_truncation_and_delivery_status() {
+        assert_eq!(format_timestamp(0.0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(truncate("abcdef", 3), "abc...");
+        assert_eq!(truncate("éclair", 2), "éc...");
+        assert_eq!(truncate("short", 10), "short");
+
+        let status = api::DeliveryStatus {
+            code: Some(550),
+            message: Some("Mailbox unavailable because recipient is disabled".to_string()),
+            description: None,
+        };
+        assert_eq!(
+            format_delivery_status(&status),
+            " [550] Mailbox unavailable because recipient is disabled"
+        );
+
+        let code_only = api::DeliveryStatus {
+            code: Some(250),
+            message: None,
+            description: None,
+        };
+        let message_only = api::DeliveryStatus {
+            code: None,
+            message: Some("queued".to_string()),
+            description: None,
+        };
+        let empty = api::DeliveryStatus {
+            code: None,
+            message: None,
+            description: None,
+        };
+        assert_eq!(format_delivery_status(&code_only), " [250]");
+        assert_eq!(format_delivery_status(&message_only), " queued");
+        assert_eq!(format_delivery_status(&empty), "");
+    }
+
+    #[test]
+    fn aggregates_stats_totals_with_missing_counts_as_zero() {
+        let entries = vec![
+            api::StatEntry {
+                time: "2026-01-01".to_string(),
+                accepted: Some(api::StatCount {
+                    total: Some(10),
+                    permanent: None,
+                    temporary: None,
+                }),
+                delivered: Some(api::StatCount {
+                    total: Some(7),
+                    permanent: None,
+                    temporary: None,
+                }),
+                failed: Some(api::StatCount {
+                    total: Some(3),
+                    permanent: Some(2),
+                    temporary: Some(1),
+                }),
+                opened: Some(api::StatCount {
+                    total: Some(4),
+                    permanent: None,
+                    temporary: None,
+                }),
+                clicked: Some(api::StatCount {
+                    total: Some(2),
+                    permanent: None,
+                    temporary: None,
+                }),
+                unsubscribed: Some(api::StatCount {
+                    total: Some(1),
+                    permanent: None,
+                    temporary: None,
+                }),
+                complained: None,
+                stored: None,
+            },
+            api::StatEntry {
+                time: "2026-01-02".to_string(),
+                accepted: Some(api::StatCount {
+                    total: None,
+                    permanent: None,
+                    temporary: None,
+                }),
+                delivered: None,
+                failed: None,
+                opened: None,
+                clicked: None,
+                unsubscribed: None,
+                complained: Some(api::StatCount {
+                    total: Some(1),
+                    permanent: None,
+                    temporary: None,
+                }),
+                stored: Some(api::StatCount {
+                    total: Some(5),
+                    permanent: None,
+                    temporary: None,
+                }),
+            },
+        ];
+
+        let totals = StatsTotals::from_entries(&entries);
+
+        assert_eq!(totals.accepted, 10);
+        assert_eq!(totals.delivered, 7);
+        assert_eq!(totals.failed, 3);
+        assert_eq!(totals.failed_permanent, 2);
+        assert_eq!(totals.failed_temporary, 1);
+        assert_eq!(totals.opened, 4);
+        assert_eq!(totals.clicked, 2);
+        assert_eq!(totals.unsubscribed, 1);
+        assert_eq!(totals.complained, 1);
+    }
+
+    #[test]
+    fn formats_api_keys_and_regions() {
+        assert_eq!(format_api_key(None), "(not set)");
+        assert_eq!(format_api_key(Some("short")), "*****");
+        assert_eq!(format_api_key(Some("key-123456789")), "key-...6789");
+
+        assert_eq!(region_label(Region::Us), "us");
+        assert_eq!(region_label(Region::Eu), "eu");
+        assert_eq!(parse_region("US").unwrap(), Region::Us);
+        assert_eq!(parse_region("eu").unwrap(), Region::Eu);
+        assert!(parse_region("ap").is_err());
+    }
+}
